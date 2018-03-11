@@ -1,10 +1,11 @@
 import json
 import time
 from queue import Empty
-from threading import Event
+from threading import Event, Thread
 
 from pytest import raises
 
+import pywebostv.connection
 from pywebostv.connection import WebOSClient
 
 from utils import MockedClientBase
@@ -100,20 +101,70 @@ class TestWebOSClient(MockedClientBase):
         client.received_message(json.dumps({"id": uri, "payload": [1]}))
         assert result == []
 
-        with raises(ValueError):
-            client.unsubscribe(uri)
+    def test_discovery(self):
+        def mock_discover(*args, **kwargs):
+            return ["host1", "host2"]
+        backup = pywebostv.connection.discover
+        pywebostv.connection.discover = mock_discover
 
-    def test_new_registration(self):
-        client = WebOSClient("ws://a")
+        expected = ["ws://{}:3000/".format(x) for x in ["host1", "host2"]]
+        assert [x.url for x in WebOSClient.discover()] == expected
+
+        pywebostv.connection.discover = backup
+
+    def test_registration_timeout(self):
+        client = WebOSClient("test-host")
+        with raises(Exception):
+            list(client.register({}, timeout=5))
+
+    def test_registration(self):
+        client = WebOSClient("test-host")
+        sent_event = Event()
+
+        def make_response(prompt, registered, wrong):
+            def send_response():
+                sent_event.wait()
+                sent_event.clear()
+
+                if prompt:
+                    client.received_message(json.dumps({
+                        "id": "1",
+                        "payload": {"pairingType": "PROMPT"}
+                    }))
+                if registered:
+                    client.received_message(json.dumps({
+                        "id": "1",
+                        "payload": {"client-key": "xyz"},
+                        "type": "registered"
+                    }))
+                if wrong:
+                    client.received_message(json.dumps({
+                        "id": "1",
+                        "type": "wrong-response"
+                    }))
+            return send_response
+
+        def patched_send(*args, **kwargs):
+            obj = WebOSClient.send(client, unique_id="1", *args, **kwargs)
+            sent_event.set()
+            return obj
+
+        client.send = patched_send
+
         store = {}
-        with raises(Exception, message="Timeout."):
-            next(client.register(store, timeout=1))
+        Thread(target=make_response(True, True, False)).start()
+        gen = client.register(store, timeout=10)
+        assert next(gen) == WebOSClient.PROMPTED
+        assert next(gen) == WebOSClient.REGISTERED
 
-        assert 'client-key' not in self.sent_message
+        assert store == {"client_key": "xyz"}
 
-        store["client_key"] = "KEY!@#"
+        # Test with non-empty store.
+        Thread(target=make_response(False, True, False)).start()
+        list(client.register(store, timeout=10)) == [WebOSClient.REGISTERED]
+        assert "xyz" in self.sent_message
 
-        with raises(Exception, message="Timeout."):
-            next(client.register(store, timeout=1))
-
-        assert 'KEY!@#' in self.sent_message
+        # Test wrong response.
+        Thread(target=make_response(False, False, True)).start()
+        with raises(Exception):
+            list(client.register(store, timeout=10))
